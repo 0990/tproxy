@@ -1,0 +1,350 @@
+#!/bin/bash
+
+tproxy_config='./tproxy.conf'
+
+readonly IPV4_RESERVED_IPADDRS=(
+    0.0.0.0/8
+    10.0.0.0/8
+    100.64.0.0/10
+    127.0.0.0/8
+    169.254.0.0/16
+    172.16.0.0/12
+    192.0.0.0/24
+    192.0.2.0/24
+    192.88.99.0/24
+    192.168.0.0/16
+    198.18.0.0/15
+    198.51.100.0/24
+    203.0.113.0/24
+    224.0.0.0/4
+    240.0.0.0/4
+    255.255.255.255/32
+)
+
+readonly IPV6_RESERVED_IPADDRS=(
+    ::/128
+    ::1/128
+    ::ffff:0:0/96
+    ::ffff:0:0:0/96
+    64:ff9b::/96
+    100::/64
+    2001::/32
+    2001:20::/28
+    2001:db8::/32
+    2002::/16
+    fc00::/7
+    fe80::/10
+    ff00::/8
+)
+
+load_config(){
+	if ! file_is_exists "$tproxy_config";then
+		log_error "file not found:$tproxy_config" 
+	else
+		source "$tproxy_config" || log_error "load config failed,exist-cod:$?"
+	fi
+}
+
+check_config(){
+	file_is_exists "$file_chnroute_set" || log_error "file not found: $file_chnroute_set"
+	file_is_exists "$file_chnroute6_set" || log_error "file not found: $file_chnroute6_set"
+	
+	[ "${#force_chn_ip4[@]}" -eq 0 -a "${#force_chn_ip6[@]}" -eq 0 ] && log_error "both force_chn_ip4 and force_chn_ip6 are empty"
+	#[ -z "$proxy_svrport" ] && log_error "the value of the proxy_svrport option is empty: $proxy_svrport"
+	
+	command_is_exists 'ipset' ||log_error "command not found: ipset"
+	command_is_exists 'ip' ||log_error "command not found: ip"
+	is_true "$ipv4" && { command_is_exists 'iptables' || log_error "command not found: iptables"; }
+	is_true "$ipv6" && { command_is_exists 'ip6tables' || log_error "command not found: ip6tables"; }
+	
+	if command_is_exists 'ss';then
+		netstat='ss'
+	elif command_is_exists 'netstat';then
+	    netstat='netstat'
+	else
+		log_error "command not found: ss/netstat"
+	fi
+}
+
+command_is_exists(){
+	command -v "$1" &>/dev/null
+}
+
+file_is_exists(){
+	[ -f "$1" ]
+}
+
+font_bold() {
+    printf "\e[1m$*\e[0m"
+}
+
+color_red() {
+    printf "\e[35m$*\e[0m"
+}
+
+color_green() {
+    printf "\e[32m$*\e[0m"
+}
+
+color_yellow() {
+    printf "\e[31m$*\e[0m"
+}
+
+log_error(){
+	echo "$(font_bold $(color_yellow '[ERROR]')) $*" 1>&2
+	exit 1
+}
+
+tcp_port_is_exists(){
+	[ $($netstat -lnpt|grep -E ":$1[ \t]"|wc -l) -ne 0 ]
+}
+
+udp_port_is_exists(){
+	[ $($netstat -anpu|grep -E ":$1[ \t]"|wc -l) -ne 0 ]
+}
+
+is_true(){
+	[ "$1" == 'true' ]
+}
+
+is_false(){
+	[ "$1" == 'false' ]
+}
+
+is_ipv4_ipts(){
+	[ "$1" = 'iptables' ]
+}
+
+is_ipv6_ipts() {
+    [ "$1" = 'ip6tables' ]
+}
+
+start(){
+	is_started && { stop; status; echo; }
+
+	enable_ipforward
+	prepare_chnset
+	start_iptables
+	modify_resolvconf
+	delete_unused_iptchains
+}
+
+is_started(){
+	iptables -t mangle -nL LOCAL_OUTPUT &>/dev/null ||
+	ip6tables -t mangle -nL LOCAL_OUTPUT &>/dev/null ||
+	[ $(ip -4 route show table $ipts_rt_tab 2>/dev/null | wc -l) -ne 0 ] ||
+	[ $(ip -6 route show table $ipts_rt_tab 2>/dev/null | wc -l) -ne 0 ] ||
+	[ $(ip -4 rule 2>/dev/null | grep -c "fwmark $ipts_rt_mark") -ne 0 ] ||
+	[ $(ip -6 rule 2>/dev/null | grep -c "fwmark $ipts_rt_mark") -ne 0 ]
+}
+
+enable_ipforward(){
+	is_true "$ipv4" && set_sysctl_option 'net.ipv4.ip_forward' 1
+	is_true "$ipv6" && set_sysctl_option 'net.ipv6.conf.all.forwarding' 1
+}
+
+set_sysctl_option(){
+	local option_name="$1" option_value="$2"
+	if command_is_exists "sysctl"; then
+		sysctl -w "$option_name=$option_value" >/dev/null
+	else
+		local option_path="/proc/sys/${option_name//.//}"
+		echo "$option_value" >$option_path
+	fi
+}
+
+prepare_chnset(){
+	ipset -X chnroute &>/dev/null
+	ipset -X chnroute6 &>/dev/null
+	ipset -R -exist<$file_chnroute_set
+	ipset -R -exist<$file_chnroute6_set
+}
+
+start_iptables(){
+	is_true "$ipv4" && start_iptables_pre_rules "iptables"
+	is_true "$ipv6" && start_iptables_pre_rules "ip6tables"
+	
+	is_true "$ipv4" && start_iptables_tproxy_mode "iptables"
+	is_true "$ipv6" && start_iptables_tproxy_mode "ip6tables"
+	
+	is_true "$ipv4" && start_iptables_post_rules "iptables"
+	is_true "$ipv6" && start_iptables_post_rules "ip6tables"
+}
+
+start_iptables_pre_rules(){
+	local iproute2_family
+	is_ipv4_ipts $1 && iproute2_family="-4" || iproute2_family="-6"
+	ip $iproute2_family route add local default dev $ipts_if_lo table $ipts_rt_tab
+	ip $iproute2_family rule add fwmark $ipts_rt_mark table $ipts_rt_tab
+	
+	$1 -t mangle -N LAN_PREROUTING
+	$1 -t mangle -N LOCAL_OUTPUT
+	$1 -t nat -N SNAT_POSTROUTING
+}
+
+start_iptables_post_rules(){
+	$1 -t mangle -A PREROUTING -j LAN_PREROUTING
+	$1 -t mangle -A OUTPUT -j  LOCAL_OUTPUT
+	$1 -t nat -A POSTROUTING -j SNAT_POSTROUTING
+}
+
+start_iptables_tproxy_mode(){
+	local loopback_addr
+	is_ipv4_ipts $1 && loopback_addr="127.0.0.1" || loopback_addr="::1:"
+	
+	local netfamily
+	is_ipv4_ipts $1 && netfamily="inet" || netfamily="inet6"
+
+	local svr_ip_array
+	is_ipv4_ipts $1 && svr_ip_array=("${force_chn_ip4[@]}") || svr_ip_array=("${force_chn_ip6[@]}")
+	
+	local chnroute_setname
+	is_ipv4_ipts $1 && chnroute_setname="chnroute" || chnroute_setname="chnroute6"
+	
+	local privaddr_setname
+	is_ipv4_ipts $1 && privaddr_setname="privaddr" || privaddr_setname="privaddr6"
+	
+	local privaddr_array
+	is_ipv4_ipts $1 && privaddr_array=("${IPV4_RESERVED_IPADDRS[@]}") || privaddr_array=("${IPV6_RESERVED_IPADDRS[@]}")
+	
+	ipset -X $privaddr_setname &>/dev/null
+	ipset -N $privaddr_setname hash:net family $netfamily
+	for privaddr in "${privaddr_array[@]}";do echo "-A $privaddr_setname $privaddr";done | ipset -R -exist &>/dev/null
+	##########################################
+	$1 -t mangle -N ROUTE_RULE
+	$1 -t mangle -A ROUTE_RULE -j CONNMARK --restore-mark
+	$1 -t mangle -A ROUTE_RULE -m mark --mark $ipts_rt_mark -j RETURN
+	
+	for svr_ip in "${svr_ip_array[@]}";do
+		$1 -t mangle -A ROUTE_RULE -p tcp -d $svr_ip -j RETURN
+		$1 -t mangle -A ROUTE_RULE -p udp -d $svr_ip -j RETURN
+	done
+	
+	$1 -t mangle -A ROUTE_RULE -m set --match-set $privaddr_setname dst -j RETURN
+	$1 -t mangle -A ROUTE_RULE -m set --match-set $chnroute_setname dst -j RETURN
+	$1 -t mangle -A ROUTE_RULE -p tcp --syn -j MARK --set-mark $ipts_rt_mark
+	$1 -t mangle -A ROUTE_RULE -p udp -m conntrack --ctstate NEW -j MARK --set-mark $ipts_rt_mark
+	
+	$1 -t mangle -A ROUTE_RULE -j CONNMARK --save-mark
+	
+	###########################################
+	
+	$1 -t mangle -A LOCAL_OUTPUT -m addrtype --src-type LOCAL ! --dst-type LOCAL -p tcp -j ROUTE_RULE
+	$1 -t mangle -A LOCAL_OUTPUT -m addrtype --src-type LOCAL ! --dst-type LOCAL -p udp -j ROUTE_RULE
+	
+	$1 -t mangle -A LAN_PREROUTING -i $ipts_if_lo -m mark ! --mark $ipts_rt_mark -j RETURN
+	
+	$1 -t mangle -A LAN_PREROUTING -m addrtype ! --src-type LOCAL ! --dst-type LOCAL -p tcp -j ROUTE_RULE
+	$1 -t mangle -A LAN_PREROUTING -m addrtype ! --src-type LOCAL ! --dst-type LOCAL -p udp -j ROUTE_RULE
+	
+	$1 -t mangle -A LAN_PREROUTING -p tcp -m mark --mark $ipts_rt_mark -j TPROXY --on-ip $loopback_addr --on-port $proxy_tcpport
+	$1 -t mangle -A LAN_PREROUTING -p udp -m mark --mark $ipts_rt_mark -j TPROXY --on-ip $loopback_addr --on-port $proxy_udpport
+
+	check_snatrule $1
+}
+
+check_snatrule(){
+	local set_snat_rule='false'
+	{ is_ipv4_ipts $1 && is_true "$ipts_set_snat"; } && set_snat_rule='true'
+	{ is_ipv6_ipts $1 && is_true "$ipts_set_snat6"; } && set_snat_rule='true'
+	is_false "$set_snat_rule" && return
+
+	$1 -t nat -N SNAT_POSTROUTING &>/dev/null
+	$1 -t nat -A SNAT_POSTROUTING -m addrtype ! --src-type LOCAL -m conntrack --ctstate SNAT,DNAT
+	$1 -t nat -A SNAT_POSTROUTING -m addrtype ! --src-type LOCAL -p tcp --syn -j MASQUERADE
+	$1 -t nat -A SNAT_POSTROUTING -m addrtype ! --src-type LOCAL -p udp -m conntrack --ctstate NEW -j MASQUERADE
+	$1 -t nat -A SNAT_POSTROUTING -m addrtype ! --src-type LOCAL -p icmp -m conntrack --ctstate NEW -j MASQUERADE
+}
+
+stop(){
+	is_true "$ipv4" && _flush_iptables "iptables"
+	is_true "$ipv6" && _flush_iptables "ip6tables"
+	
+	ipset -X privaddr &>/dev/null
+	ipset -X privaddr6 &>/dev/null
+	ipset -X chnroute &>/dev/null
+	ipset -X chnroute6 &>/dev/null
+	
+	is_true "$ipv4" && {
+		ip -4 rule del table $ipts_rt_tab
+		ip -4 route flush table $ipts_rt_tab
+	} &>/dev/null
+	
+	is_true "$ipv6" && {
+		ip -6 rule del table $ipts_rt_tab
+		ip -6 route flush table $ipts_rt_tab
+	} &>/dev/null
+}
+
+_flush_iptables(){
+	$1 -t mangle -D PREROUTING -j LAN_PREROUTING &>/dev/null
+	$1 -t mangle -D OUTPUT -j LOCAL_OUTPUT &>/dev/null
+	$1 -t nat -D POSTROUTING -j SNAT_POSTROUTING &>/dev/null
+	
+	$1 -t mangle -F LAN_PREROUTING &>/dev/null
+	$1 -t mangle -X LAN_PREROUTING &>/dev/null
+	
+	$1 -t mangle -F LOCAL_OUTPUT &>/dev/null
+	$1 -t mangle -X LOCAL_OUTPUT &>/dev/null
+	
+	$1 -t mangle -F ROUTE_RULE &>/dev/null
+	$1 -t mangle -X ROUTE_RULE &>/dev/null
+
+	$1 -t nat -F SNAT_POSTROUTING &>/dev/null
+	$1 -t nat -X SNAT_POSTROUTING &>/dev/null
+}
+
+delete_unused_iptchains(){
+	is_true "$ipv4" && _delete_unused_iptchains "iptables"
+	is_true "$ipv6" && _delete_unused_iptchains "ip6tables"
+}
+
+_delete_unused_iptchains(){
+	if is_empty_iptschain $1 mangle LAN_PREROUTING; then
+		$1 -t mangle -D PREROUTING -j LAN_PREROUTING
+		$1 -t mangle _X LAN_PREROUTING
+	fi
+
+	if is_empty_iptschain $1 mangle LOCAL_OUTPUT; then
+		$1 -t mangle -D PREROUTING -j LOCAL_OUTPUT
+		$1 -t mangle _X LOCAL_OUTPUT
+	fi
+
+	if is_empty_iptschain $1 nat SNAT_POSTROUTING; then
+		$1 -t nat -D POSTROUTING -j SNAT_POSTROUTING
+		$1 -t nat -X SNAT_POSTROUTING
+	fi
+}
+
+is_empty_iptschain(){
+	local ipts="$1" table="$2" chain="$3"
+	[ $($ipts -t $table -nvL $chain --line-numbers | grep -Ec '^[0-9]') -eq 0 ]
+}
+
+modify_resolvconf(){
+	echo "# Generated by tproxy at $(date '+%F %T')" >/etc/resolv.conf
+	is_true "$ipv4" && echo "nameserver 127.0.0.1" >>/etc/resolv.conf
+	is_true "$ipv6" && echo "nameserver ::1" >>/etc/resolv.conf
+}
+
+status(){
+	is_started && echo "tproxy: $(color_green '[running]')" ||echo "tproxy: $(color_red '[stopped]')" 
+	tcp_port_is_exists $proxy_tcpport && echo "ipt2socks/tcp: $(color_green '[running]')" ||echo "ipt2socks/tcp: $(color_red '[stopped]')"
+	udp_port_is_exists $proxy_udpport && echo "ipt2socks/udp: $(color_green '[running]')" ||echo "ipt2socks/udp: $(color_red '[stopped]')"
+}	
+	
+		
+main(){
+	load_config
+	check_config
+	
+	case $1 in
+		start)      start ;;
+		stop)       stop ;;
+		status)     status ;;
+		*)          echo "Usage: $0 {start|stop|status}" ;;
+	esac
+	return 0
+}
+
+main "$@"
